@@ -17,6 +17,8 @@ import { registerFlightTools } from './tools/flight-tools.js';
 import { registerGameStateTools } from './tools/gamestate-tools.js';
 import { registerCraftingTools } from './tools/crafting-tools.js';
 import { registerFurnaceTools } from './tools/furnace-tools.js';
+import { registerInteractionTools } from './tools/interaction-tools.js';
+import { registerActionTools } from './tools/action-tools.js';
 
 setupStdioFiltering();
 
@@ -59,8 +61,11 @@ async function main() {
   registerGameStateTools(factory, getBot);
   registerCraftingTools(factory, getBot);
   registerFurnaceTools(factory, getBot);
+  registerInteractionTools(factory, getBot);
+  const actionRunner = registerActionTools(factory, getBot);
 
   process.stdin.on('end', () => {
+    actionRunner.stop();
     connection.cleanup();
     log('info', 'MCP Client has disconnected. Shutting down...');
     process.exit(0);

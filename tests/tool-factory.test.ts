@@ -192,3 +192,74 @@ test('registerTool executor catches and returns error response on exception', as
     isError: true
   });
 });
+
+test('exclusive operation blocks normal tools but allows control tools', async (t) => {
+  const mockServer = {
+    tool: sinon.stub()
+  } as unknown as McpServer;
+  const mockConnection = {
+    checkConnectionAndReconnect: sinon.stub().resolves({ connected: true })
+  } as unknown as BotConnection;
+  const factory = new ToolFactory(mockServer, mockConnection);
+  const regularExecutor = sinon.stub().resolves({ content: [{ type: 'text', text: 'regular' }] });
+  const controlExecutor = sinon.stub().resolves({ content: [{ type: 'text', text: 'control' }] });
+
+  factory.registerTool('regular-tool', 'A regular tool', {}, regularExecutor);
+  factory.registerTool(
+    'control-tool',
+    'A control tool',
+    {},
+    controlExecutor,
+    { allowDuringExclusiveOperation: true }
+  );
+  const regularHandler = (mockServer.tool as sinon.SinonStub).getCalls()[0].args[3];
+  const controlHandler = (mockServer.tool as sinon.SinonStub).getCalls()[1].args[3];
+  const release = factory.beginExclusiveOperation('test action');
+
+  const regularResult = await regularHandler({});
+  const controlResult = await controlHandler({});
+
+  t.true(regularResult.isError);
+  t.true(regularResult.content[0].text.includes('test action is active'));
+  t.true((regularExecutor as sinon.SinonStub).notCalled);
+  t.deepEqual(controlResult, { content: [{ type: 'text', text: 'control' }] });
+  t.true((controlExecutor as sinon.SinonStub).calledOnce);
+
+  release();
+  await regularHandler({});
+  t.true((regularExecutor as sinon.SinonStub).calledOnce);
+});
+
+test('exclusive operation cannot begin while another bot tool is running', async (t) => {
+  const mockServer = {
+    tool: sinon.stub()
+  } as unknown as McpServer;
+  const mockConnection = {
+    checkConnectionAndReconnect: sinon.stub().resolves({ connected: true })
+  } as unknown as BotConnection;
+  const factory = new ToolFactory(mockServer, mockConnection);
+  let releaseExecutor!: (response: { content: { type: 'text'; text: string }[] }) => void;
+  let signalExecutorStarted!: () => void;
+  const executorStarted = new Promise<void>(resolve => {
+    signalExecutorStarted = resolve;
+  });
+  const executor = sinon.stub().callsFake(() => new Promise(resolve => {
+    releaseExecutor = resolve;
+    signalExecutorStarted();
+  }));
+
+  factory.registerTool('slow-tool', 'A slow tool', {}, executor);
+  const handler = (mockServer.tool as sinon.SinonStub).firstCall.args[3];
+  const toolCall = handler({});
+  await executorStarted;
+
+  t.throws(
+    () => factory.beginExclusiveOperation('test action'),
+    { message: 'Cannot start test action while another bot tool is running. Try again when it finishes.' }
+  );
+
+  releaseExecutor({ content: [{ type: 'text', text: 'done' }] });
+  await toolCall;
+  const release = factory.beginExclusiveOperation('test action');
+  release();
+});
