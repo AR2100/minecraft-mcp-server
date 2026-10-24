@@ -108,11 +108,14 @@ Once connected to a Minecraft server, Claude can use these commands:
 - `find-blocks` - Find one or more nearby blocks of a specific type
 
 ### Autonomous Actions
-- `collect-dirt` - Collect a target number of additional dirt blocks from a bounded coordinate area
-- `get-dirt-collection-status` - Check progress and the result of the current or most recent dirt collection job
-- `stop-dirt-collection` - Cancel the active dirt collection job
+- `collect-blocks` - Collect a target number of drop items from a specified block type within a bounded coordinate area
+- `get-block-collection-status` - Check progress and the result of the current or most recent block collection job
+- `stop-block-collection` - Cancel the active block collection job
+- `collect-dirt`, `get-dirt-collection-status`, and `stop-dirt-collection` - Backward-compatible dirt-only aliases
 
-`collect-dirt` requires a shovel and enough free inventory space. Provide an integer target from 1 to 2,304 and inclusive minimum/maximum X, Y, and Z coordinates; the selected area may contain at most 65,536 blocks. The action only digs dirt inside that area, avoids the bot's feet and head blocks, and allows up to 10 seconds after moving near a drop to confirm pickup before stopping. While it is running, other bot tools are temporarily blocked to prevent competing movement or mining commands. If the area has too little reachable dirt, the status reports a partial result rather than claiming success.
+`collect-blocks` takes an exact Minecraft block name (for example, `dirt`, `oak_log`, or `stone`), an item target from 1 to 2,304, and inclusive minimum/maximum X, Y, and Z coordinates. The selected area may contain at most 65,536 blocks. The target counts collected **items**, not blocks dug; for example, collecting `stone` targets `cobblestone` items. The action selects a compatible tool from the bot's inventory, avoids the bot's feet and head blocks, waits up to 10 seconds after moving near a drop to confirm pickup, and blocks other bot tools while it runs. If the area has too few reachable blocks, the status reports a partial result rather than claiming success.
+
+Drop handling intentionally fails closed. Supported self-drops are dirt, coarse dirt, sand, red sand, cobblestone, cobbled deepslate, and vanilla wood logs, wood, stems, hyphae, and planks. The explicit non-self mappings are `stone` -> `cobblestone` and `deepslate` -> `cobbled_deepslate`. Other block types are rejected even when `minecraft-data` reports one drop, because that metadata does not simulate block states, loot-table conditions, or all enchantment effects (for example, gravel can drop flint or gravel). This is a conservative supported subset—not a guarantee that every Minecraft block type can be collected. The action also checks that the inventory can hold the requested drop count before starting.
 
 ### Furnace
 - `smelt-item` - Smelt items using a furnace-like block

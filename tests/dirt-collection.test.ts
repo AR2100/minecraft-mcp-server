@@ -1,4 +1,5 @@
 import test from 'ava';
+import minecraftData from 'minecraft-data';
 import sinon from 'sinon';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type mineflayer from 'mineflayer';
@@ -20,12 +21,19 @@ function createBot(dirtPositions: Vec3[], occupiedInventory = false, pickupDelay
   bot: mineflayer.Bot;
   dugPositions: Vec3[];
 } {
-  const blocks = new Map<string, { name: string; position: Vec3 }>();
+  const mcData = minecraftData('1.21.11');
+  const blocks = new Map<string, { name: string; position: Vec3; canHarvest: () => boolean }>();
   for (const position of dirtPositions) {
-    blocks.set(position.toString(), { name: 'dirt', position });
+    blocks.set(position.toString(), { name: 'dirt', position, canHarvest: () => true });
   }
 
-  const shovel = { name: 'stone_shovel', count: 1, slot: 36 };
+  const shovel = {
+    name: 'stone_shovel',
+    type: mcData.itemsByName.stone_shovel.id,
+    count: 1,
+    slot: 36,
+    enchants: []
+  };
   const inventorySlots = Array(45).fill(null);
   if (occupiedInventory) {
     for (let slot = 9; slot <= 44; slot += 1) {
@@ -128,7 +136,7 @@ test('rejects collection requests larger than available inventory space', (t) =>
 
   const error = t.throws(() => runner.start(1, area));
 
-  t.truthy(error?.message.includes('hold only 0 additional dirt blocks'));
+  t.truthy(error?.message.includes('hold only 0 additional dirt item(s)'));
   t.is(runner.getStatus(), null);
 });
 
