@@ -107,6 +107,13 @@ Once connected to a Minecraft server, Claude can use these commands:
 - `get-block-info` - Get information about a block
 - `find-blocks` - Find one or more nearby blocks of a specific type
 
+### Autonomous Actions
+- `collect-dirt` - Collect a target number of additional dirt blocks from a bounded coordinate area
+- `get-dirt-collection-status` - Check progress and the result of the current or most recent dirt collection job
+- `stop-dirt-collection` - Cancel the active dirt collection job
+
+`collect-dirt` requires a shovel and enough free inventory space. Provide an integer target from 1 to 2,304 and inclusive minimum/maximum X, Y, and Z coordinates; the selected area may contain at most 65,536 blocks. The action only digs dirt inside that area, avoids the bot's feet and head blocks, and stops if it cannot confirm that a dirt drop was collected. While it is running, other bot tools are temporarily blocked to prevent competing movement or mining commands. If the area has too little reachable dirt, the status reports a partial result rather than claiming success.
+
 ### Furnace
 - `smelt-item` - Smelt items using a furnace-like block
 

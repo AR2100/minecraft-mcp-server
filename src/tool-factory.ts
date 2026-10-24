@@ -8,7 +8,14 @@ type McpResponse = {
   [key: string]: unknown;
 };
 
+interface ToolRegistrationOptions {
+  allowDuringExclusiveOperation?: boolean;
+}
+
 export class ToolFactory {
+  private activeToolCalls = 0;
+  private exclusiveOperation: string | null = null;
+
   constructor(
     private server: McpServer,
     private connection: BotConnection
@@ -19,7 +26,8 @@ export class ToolFactory {
     description: string,
     schema: Record<string, unknown>,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    executor: (args: any) => Promise<McpResponse>
+    executor: (args: any) => Promise<McpResponse>,
+    options: ToolRegistrationOptions = {}
   ): void {
     this.server.tool(name, description, schema, async (args: unknown): Promise<McpResponse> => {
       const connectionCheck = await this.connection.checkConnectionAndReconnect();
@@ -35,11 +43,38 @@ export class ToolFactory {
         const parsedArgs = this.shouldValidateSchema(schema)
           ? this.parseArgs(schema as ZodRawShape, args)
           : args;
-        return await executor(parsedArgs);
+        const releaseToolCall = options.allowDuringExclusiveOperation
+          ? undefined
+          : this.beginToolCall(name);
+
+        try {
+          return await executor(parsedArgs);
+        } finally {
+          releaseToolCall?.();
+        }
       } catch (error) {
         return this.createErrorResponse(error as Error);
       }
     });
+  }
+
+  beginExclusiveOperation(name: string): () => void {
+    if (this.exclusiveOperation) {
+      throw new Error(`Cannot start ${name} while ${this.exclusiveOperation} is active.`);
+    }
+    if (this.activeToolCalls > 0) {
+      throw new Error(`Cannot start ${name} while another bot tool is running. Try again when it finishes.`);
+    }
+
+    this.exclusiveOperation = name;
+    let released = false;
+
+    return () => {
+      if (!released && this.exclusiveOperation === name) {
+        this.exclusiveOperation = null;
+        released = true;
+      }
+    };
   }
 
   createResponse(text: string): McpResponse {
@@ -53,6 +88,22 @@ export class ToolFactory {
     return {
       content: [{ type: "text", text: `Failed: ${errorMessage}` }],
       isError: true
+    };
+  }
+
+  private beginToolCall(name: string): () => void {
+    if (this.exclusiveOperation) {
+      throw new Error(`Cannot run '${name}' while ${this.exclusiveOperation} is active. Check its status or stop it first.`);
+    }
+
+    this.activeToolCalls += 1;
+    let released = false;
+
+    return () => {
+      if (!released) {
+        this.activeToolCalls -= 1;
+        released = true;
+      }
     };
   }
 
