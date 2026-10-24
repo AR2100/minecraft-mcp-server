@@ -11,6 +11,7 @@ const PLAYER_INVENTORY_START = 9;
 const PLAYER_INVENTORY_END = 44;
 const MAX_AREA_VOLUME = 65_536;
 const MAX_TARGET_COUNT = 2_304;
+const PICKUP_CONFIRMATION_TIMEOUT_MS = 10_000;
 
 export interface DirtCollectionArea {
   minX: number;
@@ -238,11 +239,17 @@ export class DirtCollectionRunner {
           const previousDirtCount = this.getDirtCount(bot);
           await bot.dig(reachableBlock);
           status.blocksDug += 1;
+          status.message = `Waiting for the dirt drop at (${position.x}, ${position.y}, ${position.z}) to be picked up.`;
 
           let collected = await this.waitForDirtCount(bot, previousDirtCount + 1, signal, 500);
           if (!collected) {
             await bot.pathfinder.goto(new goals.GoalNear(position.x, position.y, position.z, 1));
-            collected = await this.waitForDirtCount(bot, previousDirtCount + 1, signal, 1_500);
+            collected = await this.waitForDirtCount(
+              bot,
+              previousDirtCount + 1,
+              signal,
+              PICKUP_CONFIRMATION_TIMEOUT_MS
+            );
           }
 
           status.collectedCount = Math.min(

@@ -16,7 +16,7 @@ const area: DirtCollectionArea = {
   maxZ: 0
 };
 
-function createBot(dirtPositions: Vec3[], occupiedInventory = false): {
+function createBot(dirtPositions: Vec3[], occupiedInventory = false, pickupDelayMs = 0): {
   bot: mineflayer.Bot;
   dugPositions: Vec3[];
 } {
@@ -53,7 +53,13 @@ function createBot(dirtPositions: Vec3[], occupiedInventory = false): {
     dig: async (block: { position: Vec3 }) => {
       dugPositions.push(block.position);
       blocks.delete(block.position.toString());
-      dirtCount += 1;
+      if (pickupDelayMs > 0) {
+        setTimeout(() => {
+          dirtCount += 1;
+        }, pickupDelayMs);
+      } else {
+        dirtCount += 1;
+      }
     },
     equip: sinon.stub().resolves(),
     pathfinder: {
@@ -75,8 +81,8 @@ function createRunner(bot: mineflayer.Bot): DirtCollectionRunner {
   return new DirtCollectionRunner(new ToolFactory(server, connection), () => bot);
 }
 
-async function waitForJobToFinish(runner: DirtCollectionRunner): Promise<void> {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+async function waitForJobToFinish(runner: DirtCollectionRunner, timeoutMs = 2_000): Promise<void> {
+  for (let attempt = 0; attempt < timeoutMs / 10; attempt += 1) {
     if (runner.getStatus()?.state !== 'running') {
       return;
     }
@@ -100,6 +106,20 @@ test('collects the target amount and only digs dirt inside the supplied area', a
   t.is(status?.blocksDug, 2);
   t.is(dugPositions.length, 2);
   t.true(dugPositions.every(position => position.x >= area.minX && position.x <= area.maxX));
+});
+
+test('waits for a delayed dirt pickup before marking the job incomplete', async (t) => {
+  const { bot, dugPositions } = createBot([new Vec3(1, 63, 0)], false, 2_500);
+  const runner = createRunner(bot);
+
+  runner.start(1, area);
+  await waitForJobToFinish(runner, 6_000);
+
+  const status = runner.getStatus();
+  t.is(status?.state, 'completed');
+  t.is(status?.collectedCount, 1);
+  t.is(status?.blocksDug, 1);
+  t.is(dugPositions.length, 1);
 });
 
 test('rejects collection requests larger than available inventory space', (t) => {
