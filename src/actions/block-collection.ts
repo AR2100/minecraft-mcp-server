@@ -5,6 +5,7 @@ import pathfinderPkg from 'mineflayer-pathfinder';
 import { Vec3 } from 'vec3';
 import { log } from '../logger.js';
 import { ToolFactory } from '../tool-factory.js';
+import { findCompatibleMiningTool } from './mining-tools.js';
 
 const { goals } = pathfinderPkg;
 const PLAYER_INVENTORY_START = 9;
@@ -36,16 +37,6 @@ const SAFE_DROP_TRANSFORMS = new Map([
   ['deepslate', 'cobbled_deepslate']
 ]);
 const WOOD_BLOCK_SUFFIXES = ['_log', '_wood', '_stem', '_hyphae', '_planks'];
-
-const TOOL_PRIORITY = [
-  'netherite',
-  'diamond',
-  'iron',
-  'copper',
-  'stone',
-  'golden',
-  'wooden'
-];
 
 export interface BlockCollectionArea {
   minX: number;
@@ -90,7 +81,6 @@ interface ActiveBlockCollection {
 type InventoryItem = ReturnType<mineflayer.Bot['inventory']['items']>[number];
 type MinecraftData = ReturnType<typeof minecraftData>;
 type BlockData = MinecraftData['blocksByName'][string];
-type ToolCategory = 'axe' | 'hoe' | 'pickaxe' | 'shovel';
 
 export class BlockCollectionRunner {
   private activeCollection: ActiveBlockCollection | null = null;
@@ -140,7 +130,7 @@ export class BlockCollectionRunner {
       );
     }
 
-    this.findMiningTool(bot, blockData, normalizedBlockType, dropItem);
+    findCompatibleMiningTool(bot, blockData, normalizedBlockType, dropItem);
     const releaseExclusiveOperation = this.factory.beginExclusiveOperation('block collection');
     const status: BlockCollectionStatus = {
       jobId: randomUUID(),
@@ -284,54 +274,6 @@ export class BlockCollectionRunner {
     }
 
     return capacity;
-  }
-
-  private findMiningTool(
-    bot: mineflayer.Bot,
-    blockData: BlockData,
-    blockType: string,
-    dropItem: string
-  ): InventoryItem | undefined {
-    const toolCategory = this.getToolCategory(blockData.material);
-    const harvestTools = blockData.harvestTools;
-    const candidates = bot.inventory.items().filter(item => {
-      if (toolCategory && !item.name.endsWith(`_${toolCategory}`)) {
-        return false;
-      }
-      return !harvestTools || harvestTools[item.type] === true;
-    });
-
-    candidates.sort((first, second) =>
-      this.getToolPriority(first.name) - this.getToolPriority(second.name)
-    );
-
-    const dropDiffersFromBlock = dropItem !== blockType;
-    const usableTools = candidates.filter(item =>
-      !dropDiffersFromBlock || !item.enchants.some(enchantment => enchantment.name === 'silk_touch')
-    );
-
-    if (usableTools.length === 0 && (toolCategory || harvestTools)) {
-      if (dropDiffersFromBlock && candidates.length > 0) {
-        throw new Error(
-          `The available tool for '${blockType}' has Silk Touch, which may change its drop from '${dropItem}'. ` +
-          'Provide a non-Silk-Touch tool to avoid collecting an unexpected item.'
-        );
-      }
-      const requiredTool = toolCategory ? `a compatible ${toolCategory}` : 'a compatible tool';
-      throw new Error(`The bot needs ${requiredTool} in its inventory to collect '${blockType}'.`);
-    }
-
-    return usableTools[0];
-  }
-
-  private getToolCategory(material?: string): ToolCategory | undefined {
-    const match = material?.match(/^mineable\/(axe|hoe|pickaxe|shovel)$/);
-    return match?.[1] as ToolCategory | undefined;
-  }
-
-  private getToolPriority(itemName: string): number {
-    const material = TOOL_PRIORITY.findIndex(tier => itemName.startsWith(`${tier}_`));
-    return material === -1 ? TOOL_PRIORITY.length : material;
   }
 
   private findNearestBlockIndex(bot: mineflayer.Bot, positions: Vec3[]): number {
@@ -576,7 +518,7 @@ export class BlockCollectionRunner {
 
         let miningTool: InventoryItem | undefined;
         try {
-          miningTool = this.findMiningTool(bot, blockData, status.blockType, status.dropItem);
+          miningTool = findCompatibleMiningTool(bot, blockData, status.blockType, status.dropItem);
         } catch (error) {
           status.state = 'incomplete';
           status.message =

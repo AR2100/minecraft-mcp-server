@@ -19,6 +19,7 @@ import { registerCraftingTools } from './tools/crafting-tools.js';
 import { registerFurnaceTools } from './tools/furnace-tools.js';
 import { registerInteractionTools } from './tools/interaction-tools.js';
 import { registerActionTools } from './tools/action-tools.js';
+import { registerStripMiningTools } from './tools/strip-mining-tools.js';
 
 setupStdioFiltering();
 
@@ -63,9 +64,11 @@ async function main() {
   registerFurnaceTools(factory, getBot);
   registerInteractionTools(factory, getBot);
   const actionRunner = registerActionTools(factory, getBot);
+  const stripMiningRunner = registerStripMiningTools(factory, getBot);
 
   process.stdin.on('end', () => {
     actionRunner.stop();
+    stripMiningRunner.stop();
     connection.cleanup();
     log('info', 'MCP Client has disconnected. Shutting down...');
     process.exit(0);
