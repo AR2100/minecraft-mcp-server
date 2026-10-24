@@ -40,6 +40,9 @@ interface BotOptions {
   dropYOffset?: number;
   hazardousDrop?: boolean;
   pickupFails?: boolean;
+  breakToolAfterDigs?: number;
+  replacementToolName?: string;
+  canHarvest?: boolean;
 }
 
 function createBot(blockType: string, toolName: string, dropItem: string, options: BotOptions = {}) {
@@ -59,6 +62,7 @@ function createBot(blockType: string, toolName: string, dropItem: string, option
     enchants: options.silkTouch ? [{ name: 'silk_touch', lvl: 1 }] : []
   };
   const slots: Array<InventoryStack | null> = Array(45).fill(null);
+  let replacementTool: InventoryStack | undefined;
   if (options.occupiedItem) {
     const occupiedData = mcData.itemsByName[options.occupiedItem];
     if (!occupiedData) {
@@ -75,8 +79,24 @@ function createBot(blockType: string, toolName: string, dropItem: string, option
     }
   }
   slots[36] = tool;
+  if (options.replacementToolName) {
+    const replacementData = mcData.itemsByName[options.replacementToolName];
+    if (!replacementData) {
+      throw new Error(`Test fixture data missing for ${options.replacementToolName}.`);
+    }
+    replacementTool = {
+      name: options.replacementToolName,
+      type: replacementData.id,
+      count: 1,
+      slot: 37,
+      enchants: []
+    };
+    slots[37] = replacementTool;
+  }
 
   let collectedCount = 0;
+  let digCount = 0;
+  let heldItem: InventoryStack | null = null;
   const position = new Vec3(1, 64, 1);
   const blocks = new Map<string, {
     name: string;
@@ -91,7 +111,7 @@ function createBot(blockType: string, toolName: string, dropItem: string, option
       name: blockType,
       type: blockData.id,
       position: blockPosition,
-      canHarvest: sinon.stub().returns(true)
+      canHarvest: sinon.stub().returns(options.canHarvest ?? true)
     });
   }
   const entities: Record<number, {
@@ -150,10 +170,20 @@ function createBot(blockType: string, toolName: string, dropItem: string, option
     },
     canDigBlock: () => true,
     canSeeBlock: () => true,
-    equip: sinon.stub().resolves(),
+    get heldItem() {
+      return heldItem;
+    },
+    equip: sinon.stub().callsFake(async (item: InventoryStack) => {
+      heldItem = item;
+    }),
     dig: sinon.stub().callsFake(async (targetBlock: { position: Vec3 }) => {
       blocks.delete(targetBlock.position.toString());
       dugPositions.push(targetBlock.position);
+      digCount += 1;
+      if (options.breakToolAfterDigs === digCount) {
+        slots[tool.slot] = null;
+        heldItem = null;
+      }
       if (options.delayedPickupMs) {
         setTimeout(() => {
           collectedCount += 1;
@@ -193,6 +223,7 @@ function createBot(blockType: string, toolName: string, dropItem: string, option
     bot: bot as unknown as mineflayer.Bot,
     block: blocks.get(position.toString()),
     tool,
+    replacementTool,
     dugPositions,
     get dugCountAtFirstPickup() {
       return dugCountAtFirstPickup;
@@ -271,6 +302,62 @@ test('collects stone drops with a pickaxe and targets cobblestone', async t => {
   t.is(started.dropItem, 'cobblestone');
   t.is(status.state, 'completed');
   t.true((bot.equip as sinon.SinonStub).calledWith(tool, 'hand'));
+});
+
+test('switches to a compatible replacement tool after the current tool breaks', async t => {
+  const fixture = createBot(
+    'stone',
+    'stone_pickaxe',
+    'cobblestone',
+    {
+      additionalBlockCount: 1,
+      breakToolAfterDigs: 1,
+      replacementToolName: 'stone_pickaxe'
+    }
+  );
+  const runner = createRunner(fixture.bot);
+
+  runner.start('stone', 2, area, { harvestBatchSize: 2, collectionWindowSeconds: 1 });
+  const status = await waitForTerminalStatus(runner);
+  const equipCalls = (fixture.bot.equip as sinon.SinonStub).getCalls();
+
+  t.is(status.state, 'completed');
+  t.is(status.blocksDug, 2);
+  t.is(status.collectedCount, 2);
+  t.truthy(fixture.replacementTool);
+  t.true(equipCalls.some(call => (call.args[0] as InventoryStack).slot === 37));
+});
+
+test('stops harvesting when the tool breaks and no compatible replacement remains', async t => {
+  const fixture = createBot(
+    'stone',
+    'stone_pickaxe',
+    'cobblestone',
+    { additionalBlockCount: 1, breakToolAfterDigs: 1 }
+  );
+  const runner = createRunner(fixture.bot);
+
+  runner.start('stone', 2, area, { harvestBatchSize: 2, collectionWindowSeconds: 1 });
+  const status = await waitForTerminalStatus(runner);
+
+  t.is(status.state, 'incomplete');
+  t.is(status.blocksDug, 1);
+  t.is(status.collectedCount, 1);
+  t.true(status.message.includes('no suitable harvesting tool is available'));
+  t.is((fixture.bot.dig as sinon.SinonStub).callCount, 1);
+});
+
+test('stops harvesting when the available tool cannot harvest the block for its drop', async t => {
+  const { bot } = createBot('stone', 'stone_pickaxe', 'cobblestone', { canHarvest: false });
+  const runner = createRunner(bot);
+
+  runner.start('stone', 1, area);
+  const status = await waitForTerminalStatus(runner);
+
+  t.is(status.state, 'incomplete');
+  t.is(status.blocksDug, 0);
+  t.true(status.message.includes('cannot harvest this block for its drop'));
+  t.is((bot.dig as sinon.SinonStub).callCount, 0);
 });
 
 test('collects deepslate drops as cobbled deepslate', async t => {

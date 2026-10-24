@@ -140,7 +140,7 @@ export class BlockCollectionRunner {
       );
     }
 
-    const tool = this.findMiningTool(bot, blockData, normalizedBlockType, dropItem);
+    this.findMiningTool(bot, blockData, normalizedBlockType, dropItem);
     const releaseExclusiveOperation = this.factory.beginExclusiveOperation('block collection');
     const status: BlockCollectionStatus = {
       jobId: randomUUID(),
@@ -165,7 +165,7 @@ export class BlockCollectionRunner {
     };
 
     this.activeCollection = collection;
-    void this.runCollection(collection, bot, tool);
+    void this.runCollection(collection, bot, blockData);
     return { ...status, area: { ...status.area } };
   }
 
@@ -548,7 +548,7 @@ export class BlockCollectionRunner {
   private async runCollection(
     collection: ActiveBlockCollection,
     bot: mineflayer.Bot,
-    tool: InventoryItem | undefined
+    blockData: BlockData
   ): Promise<void> {
     const { status, abortController } = collection;
     const { signal } = abortController;
@@ -561,9 +561,6 @@ export class BlockCollectionRunner {
       await new Promise<void>(resolve => setImmediate(resolve));
       this.throwIfAborted(signal);
       initialItemCount = this.getItemCount(bot, status.dropItem);
-      if (tool) {
-        await bot.equip(tool, 'hand');
-      }
 
       const positions = this.findBlocksInArea(bot, status.area, status.blockType);
       status.message = `Found ${positions.length} '${status.blockType}' block(s) in the area.`;
@@ -577,8 +574,28 @@ export class BlockCollectionRunner {
           break;
         }
 
+        let miningTool: InventoryItem | undefined;
+        try {
+          miningTool = this.findMiningTool(bot, blockData, status.blockType, status.dropItem);
+        } catch (error) {
+          status.state = 'incomplete';
+          status.message =
+            `Stopped harvesting '${status.blockType}' because no suitable harvesting tool is available: ` +
+            `${this.formatError(error)} Collected ${status.collectedCount} of ${status.targetCount} requested ` +
+            `'${status.dropItem}' item(s).`;
+          return;
+        }
+        if (miningTool) {
+          await bot.equip(miningTool, 'hand');
+        }
+
         const nextPositionIndex = this.findNearestBlockIndex(bot, positions);
-        const nearbyHarvestableBlock = this.hasNearbyHarvestableBlock(bot, positions, status.blockType, tool);
+        const nearbyHarvestableBlock = this.hasNearbyHarvestableBlock(
+          bot,
+          positions,
+          status.blockType,
+          miningTool
+        );
         const nearbyDrop = this.findNearbyDropEntities(bot, status, attemptedDropIds).length > 0;
         const shouldCollectBeforeHarvest = nearbyDrop && !nearbyHarvestableBlock;
 
@@ -629,12 +646,17 @@ export class BlockCollectionRunner {
             status.skippedBlocks += 1;
             continue;
           }
-          if (
-            !bot.canDigBlock(reachableBlock) ||
-            !reachableBlock.canHarvest(tool?.type ?? null)
-          ) {
+          if (!bot.canDigBlock(reachableBlock)) {
             status.skippedBlocks += 1;
             continue;
+          }
+          if (!reachableBlock.canHarvest(miningTool?.type ?? null)) {
+            status.state = 'incomplete';
+            status.message =
+              `Stopped harvesting '${status.blockType}' because the available tool cannot harvest this block ` +
+              `for its drop. Collected ${status.collectedCount} of ${status.targetCount} requested ` +
+              `'${status.dropItem}' item(s).`;
+            return;
           }
 
           await bot.dig(reachableBlock);
