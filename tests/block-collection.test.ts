@@ -35,6 +35,11 @@ interface BotOptions {
   occupiedItem?: string;
   delayedPickupMs?: number;
   silkTouch?: boolean;
+  deferPickup?: boolean;
+  additionalBlockCount?: number;
+  dropYOffset?: number;
+  hazardousDrop?: boolean;
+  pickupFails?: boolean;
 }
 
 function createBot(blockType: string, toolName: string, dropItem: string, options: BotOptions = {}) {
@@ -73,13 +78,31 @@ function createBot(blockType: string, toolName: string, dropItem: string, option
 
   let collectedCount = 0;
   const position = new Vec3(1, 64, 1);
-  const block = {
-    name: blockType,
-    type: blockData.id,
-    position,
-    canHarvest: sinon.stub().returns(true)
-  };
-  let blockAvailable = true;
+  const blocks = new Map<string, {
+    name: string;
+    type: number;
+    position: Vec3;
+    canHarvest: () => boolean;
+  }>();
+  const blockCount = 1 + (options.additionalBlockCount ?? 0);
+  for (let index = 0; index < blockCount; index += 1) {
+    const blockPosition = position.offset(-index, 0, 0);
+    blocks.set(blockPosition.toString(), {
+      name: blockType,
+      type: blockData.id,
+      position: blockPosition,
+      canHarvest: sinon.stub().returns(true)
+    });
+  }
+  const entities: Record<number, {
+    id: number;
+    isValid: boolean;
+    position: Vec3;
+    getDroppedItem: () => { name: string };
+  }> = {};
+  const dugPositions: Vec3[] = [];
+  let nextEntityId = 1;
+  let dugCountAtFirstPickup: number | undefined;
 
   const inventory = {
     slots,
@@ -107,10 +130,16 @@ function createBot(blockType: string, toolName: string, dropItem: string, option
   const bot = {
     version: '1.21.8',
     inventory,
+    entities,
     entity: { position: new Vec3(0, 64, 0) },
     blockAt: (target: Vec3) => {
-      if (blockAvailable && target.equals(position)) {
-        return block;
+      const block = blocks.get(target.toString());
+      if (block) return block;
+      if (
+        options.hazardousDrop &&
+        Object.values(entities).some(entity => entity.position.equals(target))
+      ) {
+        return { name: 'fire', position: target };
       }
       return {
         name: 'air',
@@ -122,15 +151,21 @@ function createBot(blockType: string, toolName: string, dropItem: string, option
     canDigBlock: () => true,
     canSeeBlock: () => true,
     equip: sinon.stub().resolves(),
-    dig: sinon.stub().callsFake(async () => {
-      blockAvailable = false;
+    dig: sinon.stub().callsFake(async (targetBlock: { position: Vec3 }) => {
+      blocks.delete(targetBlock.position.toString());
+      dugPositions.push(targetBlock.position);
       if (options.delayedPickupMs) {
-        await new Promise<void>(resolve => {
-          setTimeout(() => {
-            collectedCount += 1;
-            resolve();
-          }, options.delayedPickupMs);
-        });
+        setTimeout(() => {
+          collectedCount += 1;
+        }, options.delayedPickupMs);
+      } else if (options.deferPickup) {
+        const drop = {
+          id: nextEntityId++,
+          isValid: true,
+          position: targetBlock.position.offset(0, options.dropYOffset ?? 0, 0),
+          getDroppedItem: () => ({ name: dropItem })
+        };
+        entities[drop.id] = drop;
       } else {
         collectedCount += 1;
       }
@@ -138,12 +173,31 @@ function createBot(blockType: string, toolName: string, dropItem: string, option
     clearControlStates: sinon.stub(),
     stopDigging: sinon.stub(),
     pathfinder: {
-      goto: sinon.stub().resolves(),
+      goto: sinon.stub().callsFake(async () => {
+        if (options.pickupFails && Object.keys(entities).length > 0) {
+          throw new Error('The drop cannot be reached.');
+        }
+        const drop = Object.values(entities).find(entity => entity.isValid);
+        if (drop) {
+          dugCountAtFirstPickup ??= dugPositions.length;
+          collectedCount += 1;
+          drop.isValid = false;
+          delete entities[drop.id];
+        }
+      }),
       stop: sinon.stub()
     }
   };
 
-  return { bot: bot as unknown as mineflayer.Bot, block, tool };
+  return {
+    bot: bot as unknown as mineflayer.Bot,
+    block: blocks.get(position.toString()),
+    tool,
+    dugPositions,
+    get dugCountAtFirstPickup() {
+      return dugCountAtFirstPickup;
+    }
+  };
 }
 
 function createRunner(bot: mineflayer.Bot) {
@@ -179,7 +233,12 @@ test('block collection registers generic and legacy tools', t => {
 
   registerActionTools(factory, () => ({} as mineflayer.Bot));
 
-  const names = (server.tool as sinon.SinonStub).getCalls().map(call => call.args[0]);
+  const calls = (server.tool as sinon.SinonStub).getCalls();
+  const names = calls.map(call => call.args[0]);
+  const collectBlocksCall = calls.find(call => call.args[0] === 'collect-blocks');
+  t.truthy(collectBlocksCall);
+  t.true('harvestBatchSize' in (collectBlocksCall!.args[2] as Record<string, unknown>));
+  t.true('collectionWindowSeconds' in (collectBlocksCall!.args[2] as Record<string, unknown>));
   t.true(names.includes('collect-blocks'));
   t.true(names.includes('get-block-collection-status'));
   t.true(names.includes('stop-block-collection'));
@@ -260,6 +319,105 @@ test('allows delayed pickup within the confirmation window', async t => {
 
   t.is(status.state, 'completed');
   t.is(status.collectedCount, 1);
+});
+
+test('harvests the configured batch before attempting nearby drop pickup', async t => {
+  const fixture = createBot(
+    'oak_log',
+    'stone_axe',
+    'oak_log',
+    { deferPickup: true, additionalBlockCount: 2 }
+  );
+  const { bot } = fixture;
+  const runner = createRunner(bot);
+
+  runner.start('oak_log', 1, area, {
+    harvestBatchSize: 2,
+    collectionWindowSeconds: 1
+  });
+  const status = await waitForTerminalStatus(runner);
+
+  t.is(status.state, 'completed');
+  t.is(status.blocksDug, 2);
+  t.is(status.collectedCount, 1);
+  t.is(status.harvestBatchSize, 2);
+  t.is(status.collectionWindowSeconds, 1);
+  t.is(fixture.dugCountAtFirstPickup, 2);
+});
+
+test('continues harvesting when drops fall too far below the collection area', async t => {
+  const { bot } = createBot(
+    'oak_log',
+    'stone_axe',
+    'oak_log',
+    { deferPickup: true, additionalBlockCount: 1, dropYOffset: -12 }
+  );
+  const runner = createRunner(bot);
+
+  runner.start('oak_log', 2, area, {
+    harvestBatchSize: 1,
+    collectionWindowSeconds: 1
+  });
+  const status = await waitForTerminalStatus(runner, 5_000);
+
+  t.is(status.state, 'incomplete');
+  t.is(status.blocksDug, 2);
+  t.is(status.collectedCount, 0);
+});
+
+test('does not pursue drops in fire and continues harvesting', async t => {
+  const { bot } = createBot(
+    'oak_log',
+    'stone_axe',
+    'oak_log',
+    { deferPickup: true, additionalBlockCount: 1, hazardousDrop: true }
+  );
+  const runner = createRunner(bot);
+
+  runner.start('oak_log', 2, area, {
+    harvestBatchSize: 2,
+    collectionWindowSeconds: 1
+  });
+  const status = await waitForTerminalStatus(runner);
+
+  t.is(status.state, 'incomplete');
+  t.is(status.blocksDug, 2);
+  t.is(status.collectedCount, 0);
+  t.is((bot.pathfinder.goto as sinon.SinonStub).callCount, 0);
+});
+
+test('continues harvesting after an unreachable nearby drop', async t => {
+  const { bot } = createBot(
+    'oak_log',
+    'stone_axe',
+    'oak_log',
+    { deferPickup: true, additionalBlockCount: 1, pickupFails: true }
+  );
+  const runner = createRunner(bot);
+
+  runner.start('oak_log', 2, area, {
+    harvestBatchSize: 1,
+    collectionWindowSeconds: 1
+  });
+  const status = await waitForTerminalStatus(runner);
+
+  t.is(status.state, 'incomplete');
+  t.is(status.blocksDug, 2);
+  t.is(status.collectedCount, 0);
+  t.is(status.skippedDrops, 2);
+});
+
+test('rejects invalid harvest and collection cadence settings', t => {
+  const { bot } = createBot('dirt', 'stone_shovel', 'dirt');
+  const runner = createRunner(bot);
+
+  const batchError = t.throws(() => runner.start('dirt', 1, area, { harvestBatchSize: 65 }));
+  const windowError = t.throws(() =>
+    runner.start('dirt', 1, area, { collectionWindowSeconds: 0 })
+  );
+
+  t.truthy(batchError?.message.includes('harvestBatchSize'));
+  t.truthy(windowError?.message.includes('collectionWindowSeconds'));
 });
 
 test('rejects ambiguous self-drops even when metadata lists one item', t => {

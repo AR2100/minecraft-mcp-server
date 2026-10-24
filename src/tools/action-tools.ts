@@ -5,6 +5,8 @@ import { ToolFactory } from '../tool-factory.js';
 
 const coordinateSchema = z.coerce.number().int().min(-30_000_000).max(30_000_000);
 const targetCountSchema = z.coerce.number().int().min(1).max(2_304);
+const harvestBatchSizeSchema = z.coerce.number().int().min(1).max(64).default(8);
+const collectionWindowSecondsSchema = z.coerce.number().min(1).max(30).default(5);
 const actionControlOptions = { allowDuringExclusiveOperation: true };
 
 export function registerActionTools(factory: ToolFactory, getBot: () => mineflayer.Bot): BlockCollectionRunner {
@@ -12,7 +14,7 @@ export function registerActionTools(factory: ToolFactory, getBot: () => mineflay
 
   factory.registerTool(
     'collect-blocks',
-    'Collect a target number of items from one exact Minecraft block type in a bounded area. Supports selected dirt, sand, stone, deepslate, and vanilla wood blocks; rejects other conditional or variable drops rather than guessing.',
+    'Collect a target number of items from one exact Minecraft block type in a bounded area. Harvests in configurable batches, then makes a bounded pass for nearby drops; inaccessible or lost drops do not stop harvesting. Supports selected dirt, sand, stone, deepslate, and vanilla wood blocks.',
     {
       blockType: z.string().trim().min(1).describe("Exact Minecraft block name, such as 'dirt', 'stone', or 'oak_log'"),
       targetCount: targetCountSchema.describe('Number of drop items to collect (1-2304)'),
@@ -21,9 +23,26 @@ export function registerActionTools(factory: ToolFactory, getBot: () => mineflay
       minY: coordinateSchema.describe('Minimum Y coordinate of the mining area'),
       maxY: coordinateSchema.describe('Maximum Y coordinate of the mining area'),
       minZ: coordinateSchema.describe('Minimum Z coordinate of the mining area'),
-      maxZ: coordinateSchema.describe('Maximum Z coordinate of the mining area')
+      maxZ: coordinateSchema.describe('Maximum Z coordinate of the mining area'),
+      harvestBatchSize: harvestBatchSizeSchema.describe(
+        'Blocks to harvest before switching to item collection (1-64, default 8)'
+      ),
+      collectionWindowSeconds: collectionWindowSecondsSchema.describe(
+        'Maximum time to look for and collect nearby drops after each harvest batch (1-30 seconds, default 5)'
+      )
     },
-    async ({ blockType, targetCount, minX, maxX, minY, maxY, minZ, maxZ }: {
+    async ({
+      blockType,
+      targetCount,
+      minX,
+      maxX,
+      minY,
+      maxY,
+      minZ,
+      maxZ,
+      harvestBatchSize,
+      collectionWindowSeconds
+    }: {
       blockType: string;
       targetCount: number;
       minX: number;
@@ -32,12 +51,18 @@ export function registerActionTools(factory: ToolFactory, getBot: () => mineflay
       maxY: number;
       minZ: number;
       maxZ: number;
+      harvestBatchSize: number;
+      collectionWindowSeconds: number;
     }) => {
       const area: BlockCollectionArea = { minX, maxX, minY, maxY, minZ, maxZ };
-      const status = blockCollection.start(blockType, targetCount, area);
+      const status = blockCollection.start(blockType, targetCount, area, {
+        harvestBatchSize,
+        collectionWindowSeconds
+      });
       return factory.createResponse(
         `Started block collection job ${status.jobId}: collecting ${targetCount} ${status.dropItem} item(s) ` +
-        `from '${status.blockType}' blocks. Use get-block-collection-status to check progress or ` +
+        `from '${status.blockType}' blocks, harvesting up to ${status.harvestBatchSize} block(s) between ` +
+        `collection passes. Use get-block-collection-status to check progress or ` +
         'stop-block-collection to cancel.'
       );
     },

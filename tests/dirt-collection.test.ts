@@ -55,6 +55,7 @@ function createBot(dirtPositions: Vec3[], occupiedInventory = false, pickupDelay
     version: '1.21.11',
     entity: { position: new Vec3(0.5, 65, 0.5) },
     inventory,
+    entities: {},
     blockAt: (position: Vec3) => blocks.get(position.toString()) ?? { name: 'air', position },
     canDigBlock: () => true,
     canSeeBlock: () => true,

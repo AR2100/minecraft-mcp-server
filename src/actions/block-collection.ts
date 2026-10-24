@@ -11,7 +11,18 @@ const PLAYER_INVENTORY_START = 9;
 const PLAYER_INVENTORY_END = 44;
 const MAX_AREA_VOLUME = 65_536;
 const MAX_TARGET_COUNT = 2_304;
-const PICKUP_CONFIRMATION_TIMEOUT_MS = 10_000;
+const MIN_HARVEST_BATCH_SIZE = 1;
+const MAX_HARVEST_BATCH_SIZE = 64;
+const DEFAULT_HARVEST_BATCH_SIZE = 8;
+const MIN_COLLECTION_WINDOW_SECONDS = 1;
+const MAX_COLLECTION_WINDOW_SECONDS = 30;
+const DEFAULT_COLLECTION_WINDOW_SECONDS = 5;
+const COLLECTION_POLL_INTERVAL_MS = 250;
+const DROP_PICKUP_CONFIRMATION_TIMEOUT_MS = 750;
+const MAX_DROP_PATHFINDING_TIMEOUT_MS = 5_000;
+const MAX_DROP_PICKUP_DISTANCE = 8;
+const MAX_DROP_FALL_DISTANCE = 8;
+const NEARBY_HARVEST_DISTANCE = 4;
 const SAFE_SELF_DROP_BLOCKS = new Set([
   'dirt',
   'coarse_dirt',
@@ -45,6 +56,11 @@ export interface BlockCollectionArea {
   maxZ: number;
 }
 
+export interface BlockCollectionOptions {
+  harvestBatchSize?: number;
+  collectionWindowSeconds?: number;
+}
+
 export type BlockCollectionState = 'running' | 'completed' | 'incomplete' | 'stopped' | 'failed';
 
 export interface BlockCollectionStatus {
@@ -56,6 +72,9 @@ export interface BlockCollectionStatus {
   collectedCount: number;
   blocksDug: number;
   skippedBlocks: number;
+  skippedDrops: number;
+  harvestBatchSize: number;
+  collectionWindowSeconds: number;
   area: BlockCollectionArea;
   startedAt: string;
   finishedAt?: string;
@@ -81,8 +100,16 @@ export class BlockCollectionRunner {
     private getBot: () => mineflayer.Bot
   ) {}
 
-  start(blockType: string, targetCount: number, area: BlockCollectionArea): BlockCollectionStatus {
+  start(
+    blockType: string,
+    targetCount: number,
+    area: BlockCollectionArea,
+    options: BlockCollectionOptions = {}
+  ): BlockCollectionStatus {
     this.validateRequest(targetCount, area);
+    const harvestBatchSize = options.harvestBatchSize ?? DEFAULT_HARVEST_BATCH_SIZE;
+    const collectionWindowSeconds = options.collectionWindowSeconds ?? DEFAULT_COLLECTION_WINDOW_SECONDS;
+    this.validateCadence(harvestBatchSize, collectionWindowSeconds);
 
     if (this.activeCollection?.status.state === 'running') {
       throw new Error('A block collection job is already running. Check its status or stop it first.');
@@ -124,6 +151,9 @@ export class BlockCollectionRunner {
       collectedCount: 0,
       blocksDug: 0,
       skippedBlocks: 0,
+      skippedDrops: 0,
+      harvestBatchSize,
+      collectionWindowSeconds,
       area: { ...area },
       startedAt: new Date().toISOString(),
       message: 'Preparing to collect blocks.'
@@ -179,6 +209,28 @@ export class BlockCollectionRunner {
       (area.maxZ - area.minZ + 1);
     if (!Number.isSafeInteger(volume) || volume > MAX_AREA_VOLUME) {
       throw new Error(`The block collection area cannot exceed ${MAX_AREA_VOLUME} blocks.`);
+    }
+  }
+
+  private validateCadence(harvestBatchSize: number, collectionWindowSeconds: number): void {
+    if (
+      !Number.isInteger(harvestBatchSize) ||
+      harvestBatchSize < MIN_HARVEST_BATCH_SIZE ||
+      harvestBatchSize > MAX_HARVEST_BATCH_SIZE
+    ) {
+      throw new Error(
+        `harvestBatchSize must be an integer from ${MIN_HARVEST_BATCH_SIZE} to ${MAX_HARVEST_BATCH_SIZE}.`
+      );
+    }
+    if (
+      !Number.isFinite(collectionWindowSeconds) ||
+      collectionWindowSeconds < MIN_COLLECTION_WINDOW_SECONDS ||
+      collectionWindowSeconds > MAX_COLLECTION_WINDOW_SECONDS
+    ) {
+      throw new Error(
+        `collectionWindowSeconds must be from ${MIN_COLLECTION_WINDOW_SECONDS} to ` +
+        `${MAX_COLLECTION_WINDOW_SECONDS}.`
+      );
     }
   }
 
@@ -282,6 +334,217 @@ export class BlockCollectionRunner {
     return material === -1 ? TOOL_PRIORITY.length : material;
   }
 
+  private findNearestBlockIndex(bot: mineflayer.Bot, positions: Vec3[]): number {
+    let nearestIndex = -1;
+    let nearestDistance = Number.POSITIVE_INFINITY;
+    const currentPosition = bot.entity.position;
+
+    for (let index = 0; index < positions.length; index += 1) {
+      const distance = this.distanceBetween(positions[index], currentPosition);
+      if (distance < nearestDistance) {
+        nearestIndex = index;
+        nearestDistance = distance;
+      }
+    }
+
+    return nearestIndex;
+  }
+
+  private hasNearbyHarvestableBlock(
+    bot: mineflayer.Bot,
+    positions: Vec3[],
+    blockType: string,
+    tool: InventoryItem | undefined
+  ): boolean {
+    return positions.some(position => {
+      if (
+        this.distanceBetween(position, bot.entity.position) > NEARBY_HARVEST_DISTANCE ||
+        this.isUnsafeToDig(bot, position)
+      ) {
+        return false;
+      }
+      const block = bot.blockAt(position);
+      return Boolean(
+        block &&
+        block.name === blockType &&
+        bot.canDigBlock(block) &&
+        bot.canSeeBlock(block) &&
+        block.canHarvest(tool?.type ?? null)
+      );
+    });
+  }
+
+  private async collectNearbyDrops(
+    collection: ActiveBlockCollection,
+    bot: mineflayer.Bot,
+    initialItemCount: number,
+    attemptedDropIds: Set<number>,
+    deadline: number
+  ): Promise<void> {
+    const { status, abortController } = collection;
+    const { signal } = abortController;
+
+    while (Date.now() < deadline && status.collectedCount < status.targetCount) {
+      this.throwIfAborted(signal);
+      this.updateCollectedCount(bot, status, initialItemCount);
+      const candidate = this.findNearbyDropEntities(bot, status, attemptedDropIds)[0];
+      if (!candidate) {
+        await this.delay(Math.min(COLLECTION_POLL_INTERVAL_MS, deadline - Date.now()), signal);
+        continue;
+      }
+
+      attemptedDropIds.add(candidate.id);
+      const previousItemCount = this.getItemCount(bot, status.dropItem);
+      try {
+        status.message =
+          `Collecting nearby '${status.dropItem}' drops (${status.collectedCount} of ` +
+          `${status.targetCount} collected).`;
+        await this.gotoWithinCollectionWindow(
+          bot,
+          new goals.GoalNear(candidate.position.x, candidate.position.y, candidate.position.z, 1),
+          deadline,
+          signal
+        );
+        this.throwIfAborted(signal);
+        const pickupWaitMs = Math.min(DROP_PICKUP_CONFIRMATION_TIMEOUT_MS, deadline - Date.now());
+        if (pickupWaitMs > 0) {
+          await this.waitForItemCount(
+            bot,
+            status.dropItem,
+            previousItemCount + 1,
+            signal,
+            pickupWaitMs
+          );
+        }
+        this.updateCollectedCount(bot, status, initialItemCount);
+        if (this.getItemCount(bot, status.dropItem) === previousItemCount) {
+          status.skippedDrops += 1;
+          status.message =
+            `Could not collect a nearby '${status.dropItem}' drop; continuing without blocking harvesting.`;
+        }
+      } catch (error) {
+        this.throwIfAborted(signal);
+        status.skippedDrops += 1;
+        status.message = `Skipped a '${status.dropItem}' drop: ${this.formatError(error)}.`;
+        log('warn', `Block collection job ${status.jobId}: ${status.message}`);
+      }
+    }
+  }
+
+  private async gotoWithinCollectionWindow(
+    bot: mineflayer.Bot,
+    goal: InstanceType<typeof goals.GoalNear>,
+    deadline: number,
+    signal: AbortSignal
+  ): Promise<void> {
+    this.throwIfAborted(signal);
+    const timeoutMs = Math.min(MAX_DROP_PATHFINDING_TIMEOUT_MS, deadline - Date.now());
+    if (timeoutMs <= 0) {
+      return;
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = (error?: unknown) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        signal.removeEventListener('abort', onAbort);
+        if (error !== undefined) {
+          reject(error);
+        } else {
+          resolve();
+        }
+      };
+      const stopPathfinder = () => {
+        try {
+          bot.pathfinder.stop();
+        } catch (error) {
+          log(
+            'warn',
+            `Could not stop pathfinding for block collection job: ${this.formatError(error)}`
+          );
+        }
+      };
+      const onAbort = () => {
+        stopPathfinder();
+        finish(new Error('Block collection was cancelled.'));
+      };
+      const timeout = setTimeout(() => {
+        stopPathfinder();
+        finish(new Error('Timed out while approaching a nearby item drop.'));
+      }, timeoutMs);
+      signal.addEventListener('abort', onAbort, { once: true });
+
+      try {
+        void bot.pathfinder.goto(goal).then(
+          () => finish(),
+          (error: unknown) => finish(error)
+        );
+      } catch (error) {
+        finish(error);
+      }
+    });
+  }
+
+  private findNearbyDropEntities(
+    bot: mineflayer.Bot,
+    status: BlockCollectionStatus,
+    attemptedDropIds: Set<number> = new Set()
+  ): Array<{ id: number; position: Vec3 }> {
+    return Object.values(bot.entities)
+      .filter(entity => {
+        if (attemptedDropIds.has(entity.id) || !entity.isValid) {
+          return false;
+        }
+        const droppedItem = entity.getDroppedItem();
+        if (!droppedItem || droppedItem.name !== status.dropItem) {
+          return false;
+        }
+        if (
+          entity.position.y < status.area.minY - MAX_DROP_FALL_DISTANCE ||
+          this.distanceBetween(entity.position, bot.entity.position) > MAX_DROP_PICKUP_DISTANCE ||
+          this.isDropInHazard(bot, entity.position)
+        ) {
+          return false;
+        }
+        return true;
+      })
+      .sort((first, second) =>
+        this.distanceBetween(first.position, bot.entity.position) -
+        this.distanceBetween(second.position, bot.entity.position)
+      )
+      .map(entity => ({ id: entity.id, position: entity.position }));
+  }
+
+  private isDropInHazard(bot: mineflayer.Bot, position: Vec3): boolean {
+    const itemBlockPosition = position.floored();
+    const positionsToCheck = [
+      itemBlockPosition,
+      itemBlockPosition.offset(0, -1, 0),
+      itemBlockPosition.offset(1, 0, 0),
+      itemBlockPosition.offset(-1, 0, 0),
+      itemBlockPosition.offset(0, 0, 1),
+      itemBlockPosition.offset(0, 0, -1)
+    ];
+    return positionsToCheck.some(blockPosition => {
+      const blockName = bot.blockAt(blockPosition)?.name;
+      return blockName === 'fire' || blockName === 'soul_fire' ||
+        blockName === 'lava' || blockName === 'flowing_lava';
+    });
+  }
+
+  private updateCollectedCount(
+    bot: mineflayer.Bot,
+    status: BlockCollectionStatus,
+    initialItemCount: number
+  ): void {
+    status.collectedCount = Math.min(
+      status.targetCount,
+      Math.max(0, this.getItemCount(bot, status.dropItem) - initialItemCount)
+    );
+  }
+
   private async runCollection(
     collection: ActiveBlockCollection,
     bot: mineflayer.Bot,
@@ -303,29 +566,55 @@ export class BlockCollectionRunner {
       }
 
       const positions = this.findBlocksInArea(bot, status.area, status.blockType);
-      if (positions.length === 0) {
-        status.state = 'incomplete';
-        status.message = `No loaded '${status.blockType}' blocks were found inside the requested area.`;
-        return;
-      }
-
-      const startingPosition = bot.entity.position.clone();
-      positions.sort((first, second) =>
-        this.distanceBetween(first, startingPosition) - this.distanceBetween(second, startingPosition)
-      );
-      let nextPositionIndex = 0;
       status.message = `Found ${positions.length} '${status.blockType}' block(s) in the area.`;
-      while (nextPositionIndex < positions.length && status.collectedCount < status.targetCount) {
+      let harvestedSinceCollection = 0;
+      const attemptedDropIds = new Set<number>();
+
+      while (status.collectedCount < status.targetCount) {
         this.throwIfAborted(signal);
-        const position = positions[nextPositionIndex];
-        nextPositionIndex += 1;
-        const block = bot.blockAt(position);
-        if (!block || block.name !== status.blockType || this.isUnsafeToDig(bot, position)) {
-          status.skippedBlocks += 1;
+        this.updateCollectedCount(bot, status, initialItemCount);
+        if (status.collectedCount >= status.targetCount) {
+          break;
+        }
+
+        const nextPositionIndex = this.findNearestBlockIndex(bot, positions);
+        const nearbyHarvestableBlock = this.hasNearbyHarvestableBlock(bot, positions, status.blockType, tool);
+        const nearbyDrop = this.findNearbyDropEntities(bot, status, attemptedDropIds).length > 0;
+        const shouldCollectBeforeHarvest = nearbyDrop && !nearbyHarvestableBlock;
+
+        if (shouldCollectBeforeHarvest || harvestedSinceCollection >= status.harvestBatchSize) {
+          await this.collectNearbyDrops(
+            collection,
+            bot,
+            initialItemCount,
+            attemptedDropIds,
+            Date.now() + status.collectionWindowSeconds * 1_000
+          );
+          harvestedSinceCollection = 0;
           continue;
         }
 
+        if (nextPositionIndex < 0) {
+          if (harvestedSinceCollection > 0) {
+            await this.collectNearbyDrops(
+              collection,
+              bot,
+              initialItemCount,
+              attemptedDropIds,
+              Date.now() + status.collectionWindowSeconds * 1_000
+            );
+          }
+          break;
+        }
+
+        const [position] = positions.splice(nextPositionIndex, 1);
         try {
+          let block = bot.blockAt(position);
+          if (!block || block.name !== status.blockType || this.isUnsafeToDig(bot, position)) {
+            status.skippedBlocks += 1;
+            continue;
+          }
+
           if (!bot.canDigBlock(block) || !bot.canSeeBlock(block)) {
             await bot.pathfinder.goto(new goals.GoalNear(position.x, position.y, position.z, 2));
             this.throwIfAborted(signal);
@@ -348,47 +637,13 @@ export class BlockCollectionRunner {
             continue;
           }
 
-          const previousItemCount = this.getItemCount(bot, status.dropItem);
           await bot.dig(reachableBlock);
           status.blocksDug += 1;
+          harvestedSinceCollection += 1;
+          this.updateCollectedCount(bot, status, initialItemCount);
           status.message =
-            `Waiting for '${status.dropItem}' from '${status.blockType}' at ` +
-            `(${position.x}, ${position.y}, ${position.z}) to be picked up.`;
-
-          let collected = await this.waitForItemCount(
-            bot,
-            status.dropItem,
-            previousItemCount + 1,
-            signal,
-            500
-          );
-          if (!collected) {
-            await bot.pathfinder.goto(new goals.GoalNear(position.x, position.y, position.z, 1));
-            collected = await this.waitForItemCount(
-              bot,
-              status.dropItem,
-              previousItemCount + 1,
-              signal,
-              PICKUP_CONFIRMATION_TIMEOUT_MS
-            );
-          }
-
-          status.collectedCount = Math.min(
-            status.targetCount,
-            Math.max(0, this.getItemCount(bot, status.dropItem) - initialItemCount)
-          );
-
-          if (!collected) {
-            status.state = 'incomplete';
-            status.message =
-              `Dug ${status.blocksDug} '${status.blockType}' block(s), but could not confirm pickup of ` +
-              `'${status.dropItem}'. Stopped to avoid leaving more drops behind.`;
-            return;
-          }
-
-          status.message =
-            `Collected ${status.collectedCount} of ${status.targetCount} requested '${status.dropItem}' item(s) ` +
-            `from '${status.blockType}' blocks.`;
+            `Harvested ${status.blocksDug} '${status.blockType}' block(s) and collected ` +
+            `${status.collectedCount} of ${status.targetCount} requested '${status.dropItem}' item(s).`;
         } catch (error) {
           this.throwIfAborted(signal);
           status.skippedBlocks += 1;
@@ -407,7 +662,8 @@ export class BlockCollectionRunner {
         status.state = 'incomplete';
         status.message =
           `Area exhausted or remaining '${status.blockType}' blocks were unreachable after collecting ` +
-          `${status.collectedCount} of ${status.targetCount} requested '${status.dropItem}' item(s).`;
+          `${status.collectedCount} of ${status.targetCount} requested '${status.dropItem}' item(s) ` +
+          `from ${status.blocksDug} harvested block(s).`;
       }
     } catch (error) {
       if (signal.aborted) {
